@@ -1,5 +1,9 @@
 # sdl2tts
 
+NOTE: this is totally a Claude vibe code for myself. I don't expect others to use it. It pairs with a endpoint (in my case a Mac Studio M1 MAx) to host the voice models.
+The rest of the readme is all my good buddy Claude:
+
+
 Push-to-talk voice input for Wayland. Hold a key, speak, release — the transcript is typed
 into whatever field has focus.
 
