@@ -10,10 +10,22 @@ Two pieces, about 430 lines total:
 | `talkwave.c` | The recorder. libpulse capture on a dedicated thread, plus a small SDL2 level-meter bar pinned bottom-centre. Writes a finalized WAV on SIGTERM. Knows nothing about transcription. |
 | `talk` | The orchestration. `start` / `stop` / `toggle`, PID state, a noise gate, the POST to your STT server, and `wtype` to inject the text. This is what your keybind calls. |
 
-Speech-to-text is delegated to any server exposing an OpenAI-compatible
-`/v1/audio/transcriptions` endpoint. There is no bundled model and no cloud dependency —
-point it at a box on your LAN or tailnet running whatever you like (this was built against
-[parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) on an M1 Mac).
+Speech-to-text is delegated, not bundled. `talk` POSTs a WAV to any server exposing an
+OpenAI-compatible `POST /v1/audio/transcriptions` endpoint and types back whatever `text`
+comes out, so there is no model to install here and nothing goes to a cloud provider unless
+you point it at one.
+
+### Designed as a cleanTTS companion
+
+It was built against **cleanTTS**, and that is the intended pairing. cleanTTS serves an
+OpenAI-compatible audio API — `/v1/audio/transcriptions` for STT alongside
+`/v1/audio/speech` for TTS — and on Apple silicon it runs Parakeet on `mps`, which is fast
+enough that a few seconds of speech comes back effectively instantly over a LAN or tailnet.
+Sending no `model` parameter (which is what `talk` does) gets the server's default STT
+engine, so no configuration beyond the URL is needed. The indicator bar's colours are
+matched to the cleanTTS palette.
+
+Nothing here is cleanTTS-specific, though — any server with that endpoint will do.
 
 ## Requirements
 
@@ -131,3 +143,15 @@ must never silently drop a real recording.
 `talk start` was a different process — the recorder isn't its child, so `wait` returns
 immediately and races `curl` against a WAV that's still being written. Poll `kill -0`
 instead.
+
+## A note on exposure
+
+`talk` sends your microphone audio to whatever `TALK_STT_URL` points at, in the clear over
+plain HTTP, with no authentication. That is a deliberate fit for a private overlay network
+(Tailscale, WireGuard) or a trusted LAN, where the transport is already encrypted and the
+listener isn't reachable from anywhere else. Don't expose the STT server to the internet or
+to an untrusted network on that basis — it has no auth of its own, and this is a microphone.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

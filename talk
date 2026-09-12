@@ -146,7 +146,7 @@ PYGATE
     return 0
   fi
 
-  # --connect-timeout fails fast when the Mac is off/off-tailnet, instead of
+  # --connect-timeout fails fast when the host is off/unreachable, instead of
   # sitting for the full --max-time with no feedback. Body and HTTP status are
   # captured separately so "unreachable" and "spoke but got nothing" are
   # distinguishable -- both were silent no-ops before.

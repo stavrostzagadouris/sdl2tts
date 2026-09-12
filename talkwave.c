@@ -37,7 +37,7 @@
 #define READ_BYTES 1280        /* 40 ms of s16le mono */
 #define FRAME_MS   33          /* ~30 fps UI */
 
-/* cleanTTS palette */
+/* Palette, matched to cleanTTS. */
 #define C_BG      0x17, 0x1a, 0x21
 #define C_BORDER  0x2a, 0x2f, 0x3a
 #define C_DIM     0x2a, 0x2f, 0x3a
