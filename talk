@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+#
+# talk — voice input: record -> STT -> type the transcript into the focused field.
+#
+#   talk start    begin recording (talkwave: libpulse capture + level meter + WAV)
+#   talk stop     stop, transcribe, wtype the result
+#   talk toggle   start if idle, stop if recording   (bound to SUPER+SPACE)
+#
+# talkwave captures the default source itself (libpulse pa_simple), so there's
+# no external recorder and nothing lost on kill — it finalizes the WAV itself.
+# STT endpoint: any OpenAI-compatible /v1/audio/transcriptions server.
+# Configure with TALK_STT_URL (and optionally TALK_STT_PEER) — see README.
+set -uo pipefail
+
+# The compositor spawns us with PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:...
+# which does NOT include ~/.local/bin, so `talkwave` would not resolve.
+PATH="$HOME/.local/bin:$PATH"
+
+STT_URL="${TALK_STT_URL:-http://127.0.0.1:5000/v1/audio/transcriptions}"
+# Tailscale peer expected to host the STT server, used only to explain failures.
+# Empty disables the Tailscale-specific diagnosis.
+STT_PEER="${TALK_STT_PEER:-}"
+STATE="$HOME/.cache/talk.state"
+LOG="$HOME/.cache/talk.log"
+
+mkdir -p "$(dirname "$STATE")"
+
+log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG"; }
+
+# True only if the state file names a process that is actually alive.
+# A stale state file (recorder died) is cleared, so a failure can never
+# wedge the toggle permanently.
+recording() {
+  [ -f "$STATE" ] || return 1
+  local job _rest
+  read -r job _rest < "$STATE"   # non-zero at EOF-without-newline; vars still set
+  [ -n "${job:-}" ] || { rm -f "$STATE"; return 1; }
+  if kill -0 "$job" 2>/dev/null; then return 0; fi
+  log "clearing stale state (pid $job gone)"
+  rm -f "$STATE"
+  return 1
+}
+
+start() {
+  # Push-to-talk: if a release event was missed (e.g. the modifier was let go
+  # before the key), a recorder can still be alive. Clear it rather than
+  # stacking a second one — that is what produced duplicate recorders.
+  if recording; then
+    local old oldwav; read -r old oldwav < "$STATE"
+    log "start: clearing live recorder $old before restart"
+    kill -TERM "$old" 2>/dev/null || true
+    # Wait for it to exit BEFORE deleting: talkwave writes the WAV *on*
+    # SIGTERM, so removing the file first would just leave the new one behind.
+    for _ in $(seq 1 30); do
+      kill -0 "$old" 2>/dev/null || break
+      sleep 0.1
+    done
+    rm -f "$oldwav" "$STATE"
+  fi
+  local wav; wav="$(mktemp -t talk.XXXXXX).wav"
+  talkwave --out "$wav" >>"$LOG" 2>&1 &
+  local job=$!
+  printf '%s %s\n' "$job" "$wav" > "$STATE"
+  log "start: pid $job -> $wav"
+}
+
+# Why did the endpoint not answer? Distinguishes the three cases that otherwise
+# look identical: Tailscale down locally, the host offline/asleep, or the host
+# up but the STT server not listening. Match the peer on DNSName as well as
+# HostName -- a machine's HostName is often nothing like its tailnet name.
+diagnose_failure() {
+  [ -n "$STT_PEER" ] || { echo "The transcription server did not respond."; return; }
+  command -v tailscale >/dev/null 2>&1 || {
+    echo "Tailscale is not installed here."; return; }
+  tailscale status --json 2>/dev/null | python3 -c '
+import sys, json
+peer = sys.argv[1].lower()
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("Could not read Tailscale status."); raise SystemExit
+state = d.get("BackendState")
+if state != "Running":
+    print("Tailscale is not connected here (state: %s)." % state); raise SystemExit
+for pr in (d.get("Peer") or {}).values():
+    ident = (pr.get("DNSName","") + " " + pr.get("HostName","")).lower()
+    if peer in ident:
+        if pr.get("Online"):
+            print("%s is online, but the STT server is not answering." % peer)
+        else:
+            print("%s is offline - probably asleep. Wake it and try again." % peer)
+        raise SystemExit
+print("%s is not on the tailnet." % peer)
+' "$STT_PEER" 2>/dev/null || echo "Could not reach Tailscale to diagnose."
+}
+
+stop() {
+  [ -f "$STATE" ] || { log "stop: not recording"; return 0; }
+  local job wav; read -r job wav < "$STATE"
+  kill -TERM "$job" 2>/dev/null || true   # talkwave finalizes the WAV on SIGTERM
+  # `wait` can't be used: talkwave was started by a *different* shell (the
+  # `start` invocation), so it is not a child of this one and wait returns
+  # immediately — which would race curl against the WAV still being written.
+  for _ in $(seq 1 50); do
+    kill -0 "$job" 2>/dev/null || break
+    sleep 0.1
+  done
+  rm -f "$STATE"
+
+  if [ ! -s "$wav" ]; then log "stop: no audio at $wav"; rm -f "$wav"; return 0; fi
+
+  # Noise gate. Parakeet invents words out of room noise, and wtype would type
+  # them into whatever field has focus. Measured on this mic at 40% volume:
+  # background TV + conversation sits at window-RMS ~0.003, so a 0.02 floor with
+  # a 3-window (60 ms) minimum rejects the room but passes real speech.
+  # Override with TALK_GATE=<rms>. Fails OPEN: a measurement error must never
+  # silently discard a real recording.
+  local gate="${TALK_GATE:-0.02}" meas pk lw verdict
+  meas="$(python3 - "$wav" "$gate" <<'PYGATE'
+import sys, wave, array, math
+try:
+    with wave.open(sys.argv[1], "rb") as w:
+        if w.getsampwidth() != 2 or w.getnchannels() != 1:
+            print("1.0 99 ok"); raise SystemExit
+        a = array.array("h"); a.frombytes(w.readframes(w.getnframes()))
+    if not len(a):
+        print("0.0 0 quiet"); raise SystemExit
+    thr = float(sys.argv[2]); win = 320; loud = 0; peak = 0.0
+    for i in range(0, len(a) - win + 1, win):
+        seg = a[i:i+win]
+        r = math.sqrt(sum(float(x)*x for x in seg) / win) / 32768.0
+        if r > peak: peak = r
+        if r > thr: loud += 1
+    print("%.4f %d %s" % (peak, loud, "ok" if loud >= 3 else "quiet"))
+except SystemExit:
+    raise
+except Exception:
+    print("1.0 99 ok")
+PYGATE
+)"
+  read -r pk lw verdict <<< "$meas"
+  log "stop: level peak=$pk loud_windows=$lw -> $verdict"
+  if [ "$verdict" = "quiet" ]; then
+    rm -f "$wav"
+    notify-send -a talk "Voice input" "No speech detected."
+    return 0
+  fi
+
+  # --connect-timeout fails fast when the Mac is off/off-tailnet, instead of
+  # sitting for the full --max-time with no feedback. Body and HTTP status are
+  # captured separately so "unreachable" and "spoke but got nothing" are
+  # distinguishable -- both were silent no-ops before.
+  local body code
+  body="$(curl -s -m 20 --connect-timeout 3 -w '\n%{http_code}' \
+              -X POST "$STT_URL" -F "file=@$wav" 2>/dev/null)"
+  local rc=$?
+  code="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  rm -f "$wav"
+
+  if [ $rc -ne 0 ]; then
+    local why; why="$(diagnose_failure)"
+    log "stop: STT unreachable (curl rc=$rc) - $why"
+    notify-send -u critical -a talk "Voice input failed" "$why Recording discarded."
+    return 0
+  fi
+  if [ "$code" != "200" ]; then
+    log "stop: STT HTTP $code"
+    notify-send -u critical -a talk "Voice input failed" "Transcription server returned HTTP $code."
+    return 0
+  fi
+
+  local text
+  text="$(printf '%s' "$body" | python3 -c 'import sys, json
+try:
+    print(json.load(sys.stdin).get("text", "").strip())
+except Exception:
+    pass' 2>/dev/null)"
+
+  if [ -n "$text" ]; then
+    log "stop: typing ${#text} chars"
+    wtype -- "$text"
+  else
+    log "stop: empty transcription"
+    notify-send -a talk "Voice input" "No speech detected."
+  fi
+}
+
+case "${1:-}" in
+  start)  start ;;
+  stop)   stop ;;
+  toggle) if recording; then stop; else start; fi ;;
+  *) echo "usage: talk {start|stop|toggle}" >&2; exit 2 ;;
+esac
